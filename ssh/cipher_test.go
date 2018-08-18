@@ -6,6 +6,7 @@ package ssh
 
 import (
 	"bytes"
+	"context"
 	"crypto"
 	"crypto/rand"
 	"testing"
@@ -38,6 +39,7 @@ func TestPacketCiphers(t *testing.T) {
 }
 
 func testPacketCipher(t *testing.T, cipher, mac string) {
+	ctx := context.Background()
 	kr := &kexResult{Hash: crypto.SHA1}
 	algs := directionAlgorithms{
 		Cipher:      cipher,
@@ -56,11 +58,11 @@ func testPacketCipher(t *testing.T, cipher, mac string) {
 	want := "bla bla"
 	input := []byte(want)
 	buf := &bytes.Buffer{}
-	if err := client.writePacket(0, buf, rand.Reader, input); err != nil {
+	if err := client.writePacket(ctx, 0, buf, rand.Reader, input); err != nil {
 		t.Fatalf("writePacket(%q, %q): %v", cipher, mac, err)
 	}
 
-	packet, err := server.readPacket(0, buf)
+	packet, err := server.readPacket(ctx, 0, buf)
 	if err != nil {
 		t.Fatalf("readPacket(%q, %q): %v", cipher, mac, err)
 	}
@@ -71,6 +73,7 @@ func testPacketCipher(t *testing.T, cipher, mac string) {
 }
 
 func TestCBCOracleCounterMeasure(t *testing.T) {
+	ctx := context.Background()
 	kr := &kexResult{Hash: crypto.SHA1}
 	algs := directionAlgorithms{
 		Cipher:      aes128cbcID,
@@ -85,7 +88,7 @@ func TestCBCOracleCounterMeasure(t *testing.T) {
 	want := "bla bla"
 	input := []byte(want)
 	buf := &bytes.Buffer{}
-	if err := client.writePacket(0, buf, rand.Reader, input); err != nil {
+	if err := client.writePacket(ctx, 0, buf, rand.Reader, input); err != nil {
 		t.Errorf("writePacket: %v", err)
 	}
 
@@ -106,7 +109,7 @@ func TestCBCOracleCounterMeasure(t *testing.T) {
 		fresh.Bytes()[i] ^= 0x01
 
 		before := fresh.Len()
-		_, err = server.readPacket(0, fresh)
+		_, err = server.readPacket(ctx, 0, fresh)
 		if err == nil {
 			t.Errorf("corrupt byte %d: readPacket succeeded ", i)
 			continue

@@ -5,8 +5,8 @@
 package ssh
 
 import (
-	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"log"
@@ -26,12 +26,12 @@ const (
 // operations.
 type packetConn interface {
 	// Encrypt and send a packet of data to the remote peer.
-	writePacket(packet []byte) error
+	writePacket(ctx context.Context, packet []byte) error
 
 	// Read a packet from the connection. The read is blocking,
 	// i.e. if error is nil, then the returned byte slice is
 	// always non-empty.
-	readPacket() ([]byte, error)
+	readPacket(ctx context.Context) ([]byte, error)
 
 	// Close closes the write-side of the connection.
 	Close() error
@@ -43,8 +43,8 @@ type transport struct {
 	reader connectionState
 	writer connectionState
 
-	bufReader *bufio.Reader
-	bufWriter *bufio.Writer
+	bufReader *bufReaderWithDeadline
+	bufWriter *bufWriterWithDeadline
 	rand      io.Reader
 	isClient  bool
 	io.Closer
@@ -55,12 +55,12 @@ type transport struct {
 type packetCipher interface {
 	// writePacket encrypts the packet and writes it to w. The
 	// contents of the packet are generally scrambled.
-	writePacket(seqnum uint32, w io.Writer, rand io.Reader, packet []byte) error
+	writePacket(ctx context.Context, seqnum uint32, w io.Writer, rand io.Reader, packet []byte) error
 
 	// readPacket reads and decrypts a packet of data. The
 	// returned packet may be overwritten by future calls of
 	// readPacket.
-	readPacket(seqnum uint32, r io.Reader) ([]byte, error)
+	readPacket(ctx context.Context, seqnum uint32, r io.Reader) ([]byte, error)
 }
 
 // connectionState represents one side (read or write) of the
@@ -109,9 +109,9 @@ func (t *transport) printPacket(p []byte, write bool) {
 }
 
 // Read and decrypt next packet.
-func (t *transport) readPacket() (p []byte, err error) {
+func (t *transport) readPacket(ctx context.Context) (p []byte, err error) {
 	for {
-		p, err = t.reader.readPacket(t.bufReader)
+		p, err = t.reader.readPacket(ctx, t.bufReader)
 		if err != nil {
 			break
 		}
@@ -126,8 +126,8 @@ func (t *transport) readPacket() (p []byte, err error) {
 	return p, err
 }
 
-func (s *connectionState) readPacket(r *bufio.Reader) ([]byte, error) {
-	packet, err := s.packetCipher.readPacket(s.seqNum, r)
+func (s *connectionState) readPacket(ctx context.Context, r *bufReaderWithDeadline) ([]byte, error) {
+	packet, err := s.packetCipher.readPacket(ctx, s.seqNum, r)
 	s.seqNum++
 	if err == nil && len(packet) == 0 {
 		err = errors.New("ssh: zero length packet")
@@ -137,6 +137,8 @@ func (s *connectionState) readPacket(r *bufio.Reader) ([]byte, error) {
 		switch packet[0] {
 		case msgNewKeys:
 			select {
+			case <-ctx.Done():
+				return nil, context.Canceled
 			case cipher := <-s.pendingKeyChange:
 				s.packetCipher = cipher
 			default:
@@ -165,17 +167,17 @@ func (s *connectionState) readPacket(r *bufio.Reader) ([]byte, error) {
 	return fresh, err
 }
 
-func (t *transport) writePacket(packet []byte) error {
+func (t *transport) writePacket(ctx context.Context, packet []byte) error {
 	if debugTransport {
 		t.printPacket(packet, true)
 	}
-	return t.writer.writePacket(t.bufWriter, t.rand, packet)
+	return t.writer.writePacket(ctx, t.bufWriter, t.rand, packet)
 }
 
-func (s *connectionState) writePacket(w *bufio.Writer, rand io.Reader, packet []byte) error {
+func (s *connectionState) writePacket(ctx context.Context, w *bufWriterWithDeadline, rand io.Reader, packet []byte) error {
 	changeKeys := len(packet) > 0 && packet[0] == msgNewKeys
 
-	err := s.packetCipher.writePacket(s.seqNum, w, rand, packet)
+	err := s.packetCipher.writePacket(ctx, s.seqNum, w, rand, packet)
 	if err != nil {
 		return err
 	}
@@ -196,8 +198,8 @@ func (s *connectionState) writePacket(w *bufio.Writer, rand io.Reader, packet []
 
 func newTransport(rwc io.ReadWriteCloser, rand io.Reader, isClient bool) *transport {
 	t := &transport{
-		bufReader: bufio.NewReader(rwc),
-		bufWriter: bufio.NewWriter(rwc),
+		bufReader: newBufReaderWithDeadline(rwc),
+		bufWriter: newBufWriterWithDeadline(rwc),
 		rand:      rand,
 		reader: connectionState{
 			packetCipher:     &streamPacketCipher{cipher: noneCipher{}},

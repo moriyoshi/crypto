@@ -5,30 +5,32 @@
 package ssh
 
 import (
+	"context"
 	"io"
 	"testing"
 )
 
 var alphabet = []byte("abcdefghijklmnopqrstuvwxyz")
 
-func TestBufferReadwrite(t *testing.T) {
+func TestBufferReadWithContextwrite(t *testing.T) {
+	ctx := context.Background()
 	b := newBuffer()
 	b.write(alphabet[:10])
-	r, _ := b.Read(make([]byte, 10))
+	r, _ := b.ReadWithContext(ctx, make([]byte, 10))
 	if r != 10 {
 		t.Fatalf("Expected written == read == 10, written: 10, read %d", r)
 	}
 
 	b = newBuffer()
 	b.write(alphabet[:5])
-	r, _ = b.Read(make([]byte, 10))
+	r, _ = b.ReadWithContext(ctx, make([]byte, 10))
 	if r != 5 {
 		t.Fatalf("Expected written == read == 5, written: 5, read %d", r)
 	}
 
 	b = newBuffer()
 	b.write(alphabet[:10])
-	r, _ = b.Read(make([]byte, 5))
+	r, _ = b.ReadWithContext(ctx, make([]byte, 5))
 	if r != 5 {
 		t.Fatalf("Expected written == 10, read == 5, written: 10, read %d", r)
 	}
@@ -36,26 +38,27 @@ func TestBufferReadwrite(t *testing.T) {
 	b = newBuffer()
 	b.write(alphabet[:5])
 	b.write(alphabet[5:15])
-	r, _ = b.Read(make([]byte, 10))
-	r2, _ := b.Read(make([]byte, 10))
+	r, _ = b.ReadWithContext(ctx, make([]byte, 10))
+	r2, _ := b.ReadWithContext(ctx, make([]byte, 10))
 	if r != 10 || r2 != 5 || 15 != r+r2 {
 		t.Fatal("Expected written == read == 15")
 	}
 }
 
 func TestBufferClose(t *testing.T) {
+	ctx := context.Background()
 	b := newBuffer()
 	b.write(alphabet[:10])
 	b.eof()
-	_, err := b.Read(make([]byte, 5))
+	_, err := b.ReadWithContext(ctx, make([]byte, 5))
 	if err != nil {
 		t.Fatal("expected read of 5 to not return EOF")
 	}
 	b = newBuffer()
 	b.write(alphabet[:10])
 	b.eof()
-	r, err := b.Read(make([]byte, 5))
-	r2, err2 := b.Read(make([]byte, 10))
+	r, err := b.ReadWithContext(ctx, make([]byte, 5))
+	r2, err2 := b.ReadWithContext(ctx, make([]byte, 10))
 	if r != 5 || r2 != 5 || err != nil || err2 != nil {
 		t.Fatal("expected reads of 5 and 5")
 	}
@@ -63,9 +66,9 @@ func TestBufferClose(t *testing.T) {
 	b = newBuffer()
 	b.write(alphabet[:10])
 	b.eof()
-	r, err = b.Read(make([]byte, 5))
-	r2, err2 = b.Read(make([]byte, 10))
-	r3, err3 := b.Read(make([]byte, 10))
+	r, err = b.ReadWithContext(ctx, make([]byte, 5))
+	r2, err2 = b.ReadWithContext(ctx, make([]byte, 10))
+	r3, err3 := b.ReadWithContext(ctx, make([]byte, 10))
 	if r != 5 || r2 != 5 || r3 != 0 || err != nil || err2 != nil || err3 != io.EOF {
 		t.Fatal("expected reads of 5 and 5 and 0, with EOF")
 	}
@@ -74,10 +77,10 @@ func TestBufferClose(t *testing.T) {
 	b.write(make([]byte, 5))
 	b.write(make([]byte, 10))
 	b.eof()
-	r, err = b.Read(make([]byte, 9))
-	r2, err2 = b.Read(make([]byte, 3))
-	r3, err3 = b.Read(make([]byte, 3))
-	r4, err4 := b.Read(make([]byte, 10))
+	r, err = b.ReadWithContext(ctx, make([]byte, 9))
+	r2, err2 = b.ReadWithContext(ctx, make([]byte, 3))
+	r3, err3 = b.ReadWithContext(ctx, make([]byte, 3))
+	r4, err4 := b.ReadWithContext(ctx, make([]byte, 10))
 	if err != nil || err2 != nil || err3 != nil || err4 != io.EOF {
 		t.Fatalf("Expected EOF on forth read only, err=%v, err2=%v, err3=%v, err4=%v", err, err2, err3, err4)
 	}

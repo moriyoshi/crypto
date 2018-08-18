@@ -6,6 +6,7 @@ package ssh
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -161,7 +162,7 @@ type ServerConn struct {
 	Permissions *Permissions
 }
 
-// NewServerConn starts a new SSH server with c as the underlying
+// NewServerConnContext starts a new SSH server with c as the underlying
 // transport.  It starts with a handshake and, if the handshake is
 // unsuccessful, it closes the connection and returns an error.  The
 // Request and NewChannel channels must be serviced, or the connection
@@ -169,7 +170,7 @@ type ServerConn struct {
 //
 // The returned error may be of type *ServerAuthError for
 // authentication errors.
-func NewServerConn(c net.Conn, config *ServerConfig) (*ServerConn, <-chan NewChannel, <-chan *Request, error) {
+func NewServerConnContext(ctx context.Context, c net.Conn, config *ServerConfig) (*ServerConn, <-chan NewChannel, <-chan *Request, error) {
 	fullConf := *config
 	fullConf.SetDefaults()
 	if fullConf.MaxAuthTries == 0 {
@@ -179,12 +180,17 @@ func NewServerConn(c net.Conn, config *ServerConfig) (*ServerConn, <-chan NewCha
 	s := &connection{
 		sshConn: sshConn{conn: c},
 	}
-	perms, err := s.serverHandshake(&fullConf)
+	perms, err := s.serverHandshake(ctx, &fullConf)
 	if err != nil {
 		c.Close()
 		return nil, nil, nil, err
 	}
 	return &ServerConn{s, perms}, s.mux.incomingChannels, s.mux.incomingRequests, nil
+}
+
+// NewServerConn simply calls NewServerConnContext with the default background context.
+func NewServerConn(c net.Conn, config *ServerConfig) (*ServerConn, <-chan NewChannel, <-chan *Request, error) {
+	return NewServerConnContext(context.Background(), c, config)
 }
 
 // signAndMarshal signs the data with the appropriate algorithm,
@@ -199,7 +205,7 @@ func signAndMarshal(k Signer, rand io.Reader, data []byte) ([]byte, error) {
 }
 
 // handshake performs key exchange and user authentication.
-func (s *connection) serverHandshake(config *ServerConfig) (*Permissions, error) {
+func (s *connection) serverHandshake(ctx context.Context, config *ServerConfig) (*Permissions, error) {
 	if len(config.hostKeys) == 0 {
 		return nil, errors.New("ssh: server has no host keys")
 	}
@@ -220,9 +226,9 @@ func (s *connection) serverHandshake(config *ServerConfig) (*Permissions, error)
 	}
 
 	tr := newTransport(s.sshConn.conn, config.Rand, false /* not client */)
-	s.transport = newServerTransport(tr, s.clientVersion, s.serverVersion, config)
+	s.transport = newServerTransport(ctx, tr, s.clientVersion, s.serverVersion, config)
 
-	if err := s.transport.waitSession(); err != nil {
+	if err := s.transport.waitSession(ctx); err != nil {
 		return nil, err
 	}
 
@@ -230,7 +236,7 @@ func (s *connection) serverHandshake(config *ServerConfig) (*Permissions, error)
 	s.sessionID = s.transport.getSessionID()
 
 	var packet []byte
-	if packet, err = s.transport.readPacket(); err != nil {
+	if packet, err = s.transport.readPacket(ctx); err != nil {
 		return nil, err
 	}
 
@@ -244,15 +250,15 @@ func (s *connection) serverHandshake(config *ServerConfig) (*Permissions, error)
 	serviceAccept := serviceAcceptMsg{
 		Service: serviceUserAuth,
 	}
-	if err := s.transport.writePacket(Marshal(&serviceAccept)); err != nil {
+	if err := s.transport.writePacket(ctx, Marshal(&serviceAccept)); err != nil {
 		return nil, err
 	}
 
-	perms, err := s.serverAuthenticate(config)
+	perms, err := s.serverAuthenticate(ctx, config)
 	if err != nil {
 		return nil, err
 	}
-	s.mux = newMux(s.transport)
+	s.mux = newMux(ctx, s.transport)
 	return perms, err
 }
 
@@ -320,7 +326,7 @@ func (l ServerAuthError) Error() string {
 // It is returned in ServerAuthError.Errors from NewServerConn.
 var ErrNoAuth = errors.New("ssh: no auth passed yet")
 
-func (s *connection) serverAuthenticate(config *ServerConfig) (*Permissions, error) {
+func (s *connection) serverAuthenticate(ctx context.Context, config *ServerConfig) (*Permissions, error) {
 	sessionID := s.transport.getSessionID()
 	var cache pubKeyCache
 	var perms *Permissions
@@ -337,7 +343,7 @@ userAuthLoop:
 				Message: "too many authentication failures",
 			}
 
-			if err := s.transport.writePacket(Marshal(discMsg)); err != nil {
+			if err := s.transport.writePacket(ctx, Marshal(discMsg)); err != nil {
 				return nil, err
 			}
 
@@ -345,7 +351,7 @@ userAuthLoop:
 		}
 
 		var userAuthReq userAuthRequestMsg
-		if packet, err := s.transport.readPacket(); err != nil {
+		if packet, err := s.transport.readPacket(ctx); err != nil {
 			if err == io.EOF {
 				return nil, &ServerAuthError{Errors: authErrs}
 			}
@@ -367,7 +373,7 @@ userAuthLoop:
 				bannerMsg := &userAuthBannerMsg{
 					Message: msg,
 				}
-				if err := s.transport.writePacket(Marshal(bannerMsg)); err != nil {
+				if err := s.transport.writePacket(ctx, Marshal(bannerMsg)); err != nil {
 					return nil, err
 				}
 			}
@@ -408,7 +414,7 @@ userAuthLoop:
 				break
 			}
 
-			prompter := &sshClientKeyboardInteractive{s}
+			prompter := &sshClientKeyboardInteractive{s, ctx}
 			perms, authErr = config.KeyboardInteractiveCallback(s, prompter.Challenge)
 		case "publickey":
 			if config.PublicKeyCallback == nil {
@@ -467,7 +473,7 @@ userAuthLoop:
 						Algo:   algo,
 						PubKey: pubKeyData,
 					}
-					if err = s.transport.writePacket(Marshal(&okMsg)); err != nil {
+					if err = s.transport.writePacket(ctx, Marshal(&okMsg)); err != nil {
 						return nil, err
 					}
 					continue userAuthLoop
@@ -526,12 +532,12 @@ userAuthLoop:
 			return nil, errors.New("ssh: no authentication methods configured but NoClientAuth is also false")
 		}
 
-		if err := s.transport.writePacket(Marshal(&failureMsg)); err != nil {
+		if err := s.transport.writePacket(ctx, Marshal(&failureMsg)); err != nil {
 			return nil, err
 		}
 	}
 
-	if err := s.transport.writePacket([]byte{msgUserAuthSuccess}); err != nil {
+	if err := s.transport.writePacket(ctx, []byte{msgUserAuthSuccess}); err != nil {
 		return nil, err
 	}
 	return perms, nil
@@ -541,6 +547,7 @@ userAuthLoop:
 // asking the client on the other side of a ServerConn.
 type sshClientKeyboardInteractive struct {
 	*connection
+	ctx context.Context
 }
 
 func (c *sshClientKeyboardInteractive) Challenge(user, instruction string, questions []string, echos []bool) (answers []string, err error) {
@@ -554,7 +561,7 @@ func (c *sshClientKeyboardInteractive) Challenge(user, instruction string, quest
 		prompts = appendBool(prompts, echos[i])
 	}
 
-	if err := c.transport.writePacket(Marshal(&userAuthInfoRequestMsg{
+	if err := c.transport.writePacket(c.ctx, Marshal(&userAuthInfoRequestMsg{
 		Instruction: instruction,
 		NumPrompts:  uint32(len(questions)),
 		Prompts:     prompts,
@@ -562,7 +569,7 @@ func (c *sshClientKeyboardInteractive) Challenge(user, instruction string, quest
 		return nil, err
 	}
 
-	packet, err := c.transport.readPacket()
+	packet, err := c.transport.readPacket(c.ctx)
 	if err != nil {
 		return nil, err
 	}

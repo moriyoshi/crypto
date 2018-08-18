@@ -5,6 +5,7 @@
 package ssh
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -95,8 +96,10 @@ type mux struct {
 	globalResponses  chan interface{}
 	incomingRequests chan *Request
 
-	errCond *sync.Cond
-	err     error
+	err error
+
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 // When debugging, each new chanList instantiation has a different
@@ -104,22 +107,20 @@ type mux struct {
 var globalOff uint32
 
 func (m *mux) Wait() error {
-	m.errCond.L.Lock()
-	defer m.errCond.L.Unlock()
-	for m.err == nil {
-		m.errCond.Wait()
-	}
+	<-m.ctx.Done()
 	return m.err
 }
 
 // newMux returns a mux that runs over the given connection.
-func newMux(p packetConn) *mux {
+func newMux(ctx context.Context, p packetConn) *mux {
+	subCtx, cancel := context.WithCancel(ctx)
 	m := &mux{
 		conn:             p,
 		incomingChannels: make(chan NewChannel, chanSize),
 		globalResponses:  make(chan interface{}, 1),
 		incomingRequests: make(chan *Request, chanSize),
-		errCond:          newCond(),
+		ctx:              subCtx,
+		cancel:           cancel,
 	}
 	if debugMux {
 		m.chanList.offset = atomic.AddUint32(&globalOff, 1)
@@ -129,21 +130,28 @@ func newMux(p packetConn) *mux {
 	return m
 }
 
-func (m *mux) sendMessage(msg interface{}) error {
+func (m *mux) sendMessage(ctx context.Context, msg interface{}) error {
+	if ctx == nil {
+		ctx = m.ctx
+	}
 	p := Marshal(msg)
 	if debugMux {
 		log.Printf("send global(%d): %#v", m.chanList.offset, msg)
 	}
-	return m.conn.writePacket(p)
+	return m.conn.writePacket(ctx, p)
 }
 
-func (m *mux) SendRequest(name string, wantReply bool, payload []byte) (bool, []byte, error) {
+func (m *mux) SendRequestWithContext(ctx context.Context, name string, wantReply bool, payload []byte) (bool, []byte, error) {
+	if ctx == nil {
+		ctx = m.ctx
+	}
+
 	if wantReply {
 		m.globalSentMu.Lock()
 		defer m.globalSentMu.Unlock()
 	}
 
-	if err := m.sendMessage(globalRequestMsg{
+	if err := m.sendMessage(ctx, globalRequestMsg{
 		Type:      name,
 		WantReply: wantReply,
 		Data:      payload,
@@ -169,13 +177,17 @@ func (m *mux) SendRequest(name string, wantReply bool, payload []byte) (bool, []
 	}
 }
 
+func (m *mux) SendRequest(name string, wantReply bool, payload []byte) (bool, []byte, error) {
+	return m.SendRequestWithContext(nil, name, wantReply, payload)
+}
+
 // ackRequest must be called after processing a global request that
 // has WantReply set.
-func (m *mux) ackRequest(ok bool, data []byte) error {
+func (m *mux) ackRequest(ctx context.Context, ok bool, data []byte) error {
 	if ok {
-		return m.sendMessage(globalRequestSuccessMsg{Data: data})
+		return m.sendMessage(ctx, globalRequestSuccessMsg{Data: data})
 	}
-	return m.sendMessage(globalRequestFailureMsg{Data: data})
+	return m.sendMessage(ctx, globalRequestFailureMsg{Data: data})
 }
 
 func (m *mux) Close() error {
@@ -186,6 +198,10 @@ func (m *mux) Close() error {
 // error is encountered. To synchronize on loop exit, use mux.Wait.
 func (m *mux) loop() {
 	var err error
+	defer func() {
+		m.err = err
+		m.cancel()
+	}()
 	for err == nil {
 		err = m.onePacket()
 	}
@@ -200,11 +216,6 @@ func (m *mux) loop() {
 
 	m.conn.Close()
 
-	m.errCond.L.Lock()
-	m.err = err
-	m.errCond.Broadcast()
-	m.errCond.L.Unlock()
-
 	if debugMux {
 		log.Println("loop exit", err)
 	}
@@ -212,7 +223,7 @@ func (m *mux) loop() {
 
 // onePacket reads and processes one packet.
 func (m *mux) onePacket() error {
-	packet, err := m.conn.readPacket()
+	packet, err := m.conn.readPacket(m.ctx)
 	if err != nil {
 		return err
 	}
@@ -283,7 +294,7 @@ func (m *mux) handleChannelOpen(packet []byte) error {
 			Message:  "invalid request",
 			Language: "en_US.UTF-8",
 		}
-		return m.sendMessage(failMsg)
+		return m.sendMessage(m.ctx, failMsg)
 	}
 
 	c := m.newChannel(msg.ChanType, channelInbound, msg.TypeSpecificData)
@@ -294,8 +305,8 @@ func (m *mux) handleChannelOpen(packet []byte) error {
 	return nil
 }
 
-func (m *mux) OpenChannel(chanType string, extra []byte) (Channel, <-chan *Request, error) {
-	ch, err := m.openChannel(chanType, extra)
+func (m *mux) OpenChannelWithContext(ctx context.Context, chanType string, extra []byte) (Channel, <-chan *Request, error) {
+	ch, err := m.openChannel(ctx, chanType, extra)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -303,7 +314,14 @@ func (m *mux) OpenChannel(chanType string, extra []byte) (Channel, <-chan *Reque
 	return ch, ch.incomingRequests, nil
 }
 
-func (m *mux) openChannel(chanType string, extra []byte) (*channel, error) {
+func (m *mux) OpenChannel(chanType string, extra []byte) (Channel, <-chan *Request, error) {
+	return m.OpenChannelWithContext(nil, chanType, extra)
+}
+
+func (m *mux) openChannel(ctx context.Context, chanType string, extra []byte) (*channel, error) {
+	if ctx == nil {
+		ctx = m.ctx
+	}
 	ch := m.newChannel(chanType, channelOutbound, extra)
 
 	ch.maxIncomingPayload = channelMaxPacket
@@ -315,7 +333,7 @@ func (m *mux) openChannel(chanType string, extra []byte) (*channel, error) {
 		TypeSpecificData: extra,
 		PeersID:          ch.localId,
 	}
-	if err := m.sendMessage(open); err != nil {
+	if err := m.sendMessage(ctx, open); err != nil {
 		return nil, err
 	}
 

@@ -5,6 +5,7 @@
 package ssh
 
 import (
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/des"
@@ -150,7 +151,17 @@ type streamPacketCipher struct {
 }
 
 // readPacket reads and decrypt a single packet from the reader argument.
-func (s *streamPacketCipher) readPacket(seqNum uint32, r io.Reader) ([]byte, error) {
+func (s *streamPacketCipher) readPacket(ctx context.Context, seqNum uint32, r io.Reader) ([]byte, error) {
+	finCh := make(chan struct{})
+	defer close(finCh)
+	go func() {
+		select {
+		case <-finCh:
+			break
+		case <-ctx.Done():
+			tryCancelReader(r)
+		}
+	}()
 	if _, err := io.ReadFull(r, s.prefix[:]); err != nil {
 		return nil, err
 	}
@@ -222,10 +233,22 @@ func (s *streamPacketCipher) readPacket(seqNum uint32, r io.Reader) ([]byte, err
 }
 
 // writePacket encrypts and sends a packet of data to the writer argument
-func (s *streamPacketCipher) writePacket(seqNum uint32, w io.Writer, rand io.Reader, packet []byte) error {
+func (s *streamPacketCipher) writePacket(ctx context.Context, seqNum uint32, w io.Writer, rand io.Reader, packet []byte) error {
 	if len(packet) > maxPacket {
 		return errors.New("ssh: packet too large")
 	}
+
+	finCh := make(chan struct{})
+	defer close(finCh)
+	go func() {
+		select {
+		case <-finCh:
+			break
+		case <-ctx.Done():
+			tryCancelReader(rand)
+			tryCancelWriter(w)
+		}
+	}()
 
 	aadlen := 0
 	if s.mac != nil && s.etm {
@@ -327,7 +350,19 @@ func newGCMCipher(key, iv, unusedMacKey []byte, unusedAlgs directionAlgorithms) 
 
 const gcmTagSize = 16
 
-func (c *gcmCipher) writePacket(seqNum uint32, w io.Writer, rand io.Reader, packet []byte) error {
+func (c *gcmCipher) writePacket(ctx context.Context, seqNum uint32, w io.Writer, rand io.Reader, packet []byte) error {
+	finCh := make(chan struct{})
+	defer close(finCh)
+	go func() {
+		select {
+		case <-finCh:
+			break
+		case <-ctx.Done():
+			tryCancelReader(rand)
+			tryCancelWriter(w)
+		}
+	}()
+
 	// Pad out to multiple of 16 bytes. This is different from the
 	// stream cipher because that encrypts the length too.
 	padding := byte(packetSizeMultiple - (1+len(packet))%packetSizeMultiple)
@@ -370,7 +405,18 @@ func (c *gcmCipher) incIV() {
 	}
 }
 
-func (c *gcmCipher) readPacket(seqNum uint32, r io.Reader) ([]byte, error) {
+func (c *gcmCipher) readPacket(ctx context.Context, seqNum uint32, r io.Reader) ([]byte, error) {
+	finCh := make(chan struct{})
+	defer close(finCh)
+	go func() {
+		select {
+		case <-finCh:
+			break
+		case <-ctx.Done():
+			tryCancelReader(r)
+		}
+	}()
+
 	if _, err := io.ReadFull(r, c.prefix[:]); err != nil {
 		return nil, err
 	}
@@ -486,8 +532,8 @@ type cbcError string
 
 func (e cbcError) Error() string { return string(e) }
 
-func (c *cbcCipher) readPacket(seqNum uint32, r io.Reader) ([]byte, error) {
-	p, err := c.readPacketLeaky(seqNum, r)
+func (c *cbcCipher) readPacket(ctx context.Context, seqNum uint32, r io.Reader) ([]byte, error) {
+	p, err := c.readPacketLeaky(ctx, seqNum, r)
 	if err != nil {
 		if _, ok := err.(cbcError); ok {
 			// Verification error: read a fixed amount of
@@ -500,7 +546,18 @@ func (c *cbcCipher) readPacket(seqNum uint32, r io.Reader) ([]byte, error) {
 	return p, err
 }
 
-func (c *cbcCipher) readPacketLeaky(seqNum uint32, r io.Reader) ([]byte, error) {
+func (c *cbcCipher) readPacketLeaky(ctx context.Context, seqNum uint32, r io.Reader) ([]byte, error) {
+	finCh := make(chan struct{})
+	defer close(finCh)
+	go func() {
+		select {
+		case <-finCh:
+			break
+		case <-ctx.Done():
+			tryCancelReader(r)
+		}
+	}()
+
 	blockSize := c.decrypter.BlockSize()
 
 	// Read the header, which will include some of the subsequent data in the
@@ -576,7 +633,19 @@ func (c *cbcCipher) readPacketLeaky(seqNum uint32, r io.Reader) ([]byte, error) 
 	return c.packetData[prefixLen:paddingStart], nil
 }
 
-func (c *cbcCipher) writePacket(seqNum uint32, w io.Writer, rand io.Reader, packet []byte) error {
+func (c *cbcCipher) writePacket(ctx context.Context, seqNum uint32, w io.Writer, rand io.Reader, packet []byte) error {
+	finCh := make(chan struct{})
+	defer close(finCh)
+	go func() {
+		select {
+		case <-finCh:
+			break
+		case <-ctx.Done():
+			tryCancelReader(rand)
+			tryCancelWriter(w)
+		}
+	}()
+
 	effectiveBlockSize := maxUInt32(cbcMinPacketSizeMultiple, c.encrypter.BlockSize())
 
 	// Length of encrypted portion of the packet (header, payload, padding).
@@ -624,7 +693,6 @@ func (c *cbcCipher) writePacket(seqNum uint32, w io.Writer, rand io.Reader, pack
 	}
 
 	c.encrypter.CryptBlocks(c.packetData[:encLength], c.packetData[:encLength])
-
 	if _, err := w.Write(c.packetData); err != nil {
 		return err
 	}
@@ -665,7 +733,7 @@ func newChaCha20Cipher(key, unusedIV, unusedMACKey []byte, unusedAlgs directionA
 	return c, nil
 }
 
-func (c *chacha20Poly1305Cipher) readPacket(seqNum uint32, r io.Reader) ([]byte, error) {
+func (c *chacha20Poly1305Cipher) readPacket(ctx context.Context, seqNum uint32, r io.Reader) ([]byte, error) {
 	nonce := [3]uint32{0, 0, bits.ReverseBytes32(seqNum)}
 	s := chacha20.New(c.contentKey, nonce)
 	var polyKey [32]byte
@@ -673,6 +741,17 @@ func (c *chacha20Poly1305Cipher) readPacket(seqNum uint32, r io.Reader) ([]byte,
 	s.Advance() // skip next 32 bytes
 
 	encryptedLength := c.buf[:4]
+
+	finCh := make(chan struct{})
+	defer close(finCh)
+	go func() {
+		select {
+		case <-finCh:
+			break
+		case <-ctx.Done():
+			tryCancelReader(r)
+		}
+	}()
 	if _, err := io.ReadFull(r, encryptedLength); err != nil {
 		return nil, err
 	}
@@ -723,7 +802,19 @@ func (c *chacha20Poly1305Cipher) readPacket(seqNum uint32, r io.Reader) ([]byte,
 	return plain, nil
 }
 
-func (c *chacha20Poly1305Cipher) writePacket(seqNum uint32, w io.Writer, rand io.Reader, payload []byte) error {
+func (c *chacha20Poly1305Cipher) writePacket(ctx context.Context, seqNum uint32, w io.Writer, rand io.Reader, payload []byte) error {
+	finCh := make(chan struct{})
+	defer close(finCh)
+	go func() {
+		select {
+		case <-finCh:
+			break
+		case <-ctx.Done():
+			tryCancelReader(rand)
+			tryCancelWriter(w)
+		}
+	}()
+
 	nonce := [3]uint32{0, 0, bits.ReverseBytes32(seqNum)}
 	s := chacha20.New(c.contentKey, nonce)
 	var polyKey [32]byte

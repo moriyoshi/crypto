@@ -5,6 +5,7 @@
 package ssh
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -16,24 +17,29 @@ import (
 	"time"
 )
 
-// Listen requests the remote peer open a listening socket on
+// ListenContext requests the remote peer open a listening socket on
 // addr. Incoming connections will be available by calling Accept on
 // the returned net.Listener. The listener must be serviced, or the
 // SSH connection may hang.
 // N must be "tcp", "tcp4", "tcp6", or "unix".
-func (c *Client) Listen(n, addr string) (net.Listener, error) {
+func (c *Client) ListenContext(ctx context.Context, n, addr string) (net.Listener, error) {
 	switch n {
 	case "tcp", "tcp4", "tcp6":
 		laddr, err := net.ResolveTCPAddr(n, addr)
 		if err != nil {
 			return nil, err
 		}
-		return c.ListenTCP(laddr)
+		return c.ListenTCPContext(ctx, laddr)
 	case "unix":
-		return c.ListenUnix(addr)
+		return c.ListenUnixContext(ctx, addr)
 	default:
 		return nil, fmt.Errorf("ssh: unsupported protocol: %s", n)
 	}
+}
+
+// Listen simply calls ListenContext with the default background context
+func (c *Client) Listen(n, addr string) (net.Listener, error) {
+	return c.ListenContext(context.Background(), n, addr)
 }
 
 // Automatic port allocation is broken with OpenSSH before 6.0. See
@@ -68,14 +74,14 @@ func isBrokenOpenSSHVersion(versionStr string) bool {
 
 // autoPortListenWorkaround simulates automatic port allocation by
 // trying random ports repeatedly.
-func (c *Client) autoPortListenWorkaround(laddr *net.TCPAddr) (net.Listener, error) {
+func (c *Client) autoPortListenWorkaround(ctx context.Context, laddr *net.TCPAddr) (net.Listener, error) {
 	var sshListener net.Listener
 	var err error
 	const tries = 10
 	for i := 0; i < tries; i++ {
 		addr := *laddr
 		addr.Port = 1024 + portRandomizer.Intn(60000)
-		sshListener, err = c.ListenTCP(&addr)
+		sshListener, err = c.ListenTCPContext(ctx, &addr)
 		if err == nil {
 			laddr.Port = addr.Port
 			return sshListener, err
@@ -98,13 +104,13 @@ func (c *Client) handleForwards() {
 	go c.forwards.handleChannels(c.HandleChannelOpen("forwarded-streamlocal@openssh.com"))
 }
 
-// ListenTCP requests the remote peer open a listening socket
+// ListenTCPContext requests the remote peer open a listening socket
 // on laddr. Incoming connections will be available by calling
 // Accept on the returned net.Listener.
-func (c *Client) ListenTCP(laddr *net.TCPAddr) (net.Listener, error) {
+func (c *Client) ListenTCPContext(ctx context.Context, laddr *net.TCPAddr) (net.Listener, error) {
 	c.handleForwardsOnce.Do(c.handleForwards)
 	if laddr.Port == 0 && isBrokenOpenSSHVersion(string(c.ServerVersion())) {
-		return c.autoPortListenWorkaround(laddr)
+		return c.autoPortListenWorkaround(ctx, laddr)
 	}
 
 	m := channelForwardMsg{
@@ -112,7 +118,7 @@ func (c *Client) ListenTCP(laddr *net.TCPAddr) (net.Listener, error) {
 		uint32(laddr.Port),
 	}
 	// send message
-	ok, resp, err := c.SendRequest("tcpip-forward", true, Marshal(&m))
+	ok, resp, err := c.SendRequestWithContext(ctx, "tcpip-forward", true, Marshal(&m))
 	if err != nil {
 		return nil, err
 	}
@@ -136,6 +142,11 @@ func (c *Client) ListenTCP(laddr *net.TCPAddr) (net.Listener, error) {
 	ch := c.forwards.add(laddr)
 
 	return &tcpListener{laddr, c, ch}, nil
+}
+
+// ListenTCP simply calls ListenTCPContext with the default background context.
+func (c *Client) ListenTCP(laddr *net.TCPAddr) (net.Listener, error) {
+	return c.ListenTCPContext(context.Background(), laddr)
 }
 
 // forwardList stores a mapping between remote
@@ -311,8 +322,8 @@ func (l *tcpListener) Accept() (net.Conn, error) {
 	}, nil
 }
 
-// Close closes the listener.
-func (l *tcpListener) Close() error {
+// CloseContext closes the listener.
+func (l *tcpListener) CloseContext(ctx context.Context) error {
 	m := channelForwardMsg{
 		l.laddr.IP.String(),
 		uint32(l.laddr.Port),
@@ -320,11 +331,16 @@ func (l *tcpListener) Close() error {
 
 	// this also closes the listener.
 	l.conn.forwards.remove(l.laddr)
-	ok, _, err := l.conn.SendRequest("cancel-tcpip-forward", true, Marshal(&m))
+	ok, _, err := l.conn.SendRequestWithContext(ctx, "cancel-tcpip-forward", true, Marshal(&m))
 	if err == nil && !ok {
 		err = errors.New("ssh: cancel-tcpip-forward failed")
 	}
 	return err
+}
+
+// Close simply calls CloseContext with the default background context
+func (l *tcpListener) Close() error {
+	return l.CloseContext(context.Background())
 }
 
 // Addr returns the listener's network address.
@@ -332,9 +348,9 @@ func (l *tcpListener) Addr() net.Addr {
 	return l.laddr
 }
 
-// Dial initiates a connection to the addr from the remote host.
+// DialContext initiates a connection to the addr from the remote host.
 // The resulting connection has a zero LocalAddr() and RemoteAddr().
-func (c *Client) Dial(n, addr string) (net.Conn, error) {
+func (c *Client) DialContext(ctx context.Context, n, addr string) (net.Conn, error) {
 	var ch Channel
 	switch n {
 	case "tcp", "tcp4", "tcp6":
@@ -347,7 +363,7 @@ func (c *Client) Dial(n, addr string) (net.Conn, error) {
 		if err != nil {
 			return nil, err
 		}
-		ch, err = c.dial(net.IPv4zero.String(), 0, host, int(port))
+		ch, err = c.dial(ctx, net.IPv4zero.String(), 0, host, int(port))
 		if err != nil {
 			return nil, err
 		}
@@ -363,7 +379,7 @@ func (c *Client) Dial(n, addr string) (net.Conn, error) {
 		}, nil
 	case "unix":
 		var err error
-		ch, err = c.dialStreamLocal(addr)
+		ch, err = c.dialStreamLocal(ctx, addr)
 		if err != nil {
 			return nil, err
 		}
@@ -383,17 +399,22 @@ func (c *Client) Dial(n, addr string) (net.Conn, error) {
 	}
 }
 
-// DialTCP connects to the remote address raddr on the network net,
+// Dial simply calls DialContext with the default background context
+func (c *Client) Dial(n, addr string) (net.Conn, error) {
+	return c.DialContext(context.Background(), n, addr)
+}
+
+// DialTCPContext connects to the remote address raddr on the network net,
 // which must be "tcp", "tcp4", or "tcp6".  If laddr is not nil, it is used
 // as the local address for the connection.
-func (c *Client) DialTCP(n string, laddr, raddr *net.TCPAddr) (net.Conn, error) {
+func (c *Client) DialTCPContext(ctx context.Context, n string, laddr, raddr *net.TCPAddr) (net.Conn, error) {
 	if laddr == nil {
 		laddr = &net.TCPAddr{
 			IP:   net.IPv4zero,
 			Port: 0,
 		}
 	}
-	ch, err := c.dial(laddr.IP.String(), laddr.Port, raddr.IP.String(), raddr.Port)
+	ch, err := c.dial(ctx, laddr.IP.String(), laddr.Port, raddr.IP.String(), raddr.Port)
 	if err != nil {
 		return nil, err
 	}
@@ -404,6 +425,11 @@ func (c *Client) DialTCP(n string, laddr, raddr *net.TCPAddr) (net.Conn, error) 
 	}, nil
 }
 
+// DialTCP simply calls DialTCPContext with the default background context
+func (c *Client) DialTCP(n string, laddr, raddr *net.TCPAddr) (net.Conn, error) {
+	return c.DialTCPContext(context.Background(), n, laddr, raddr)
+}
+
 // RFC 4254 7.2
 type channelOpenDirectMsg struct {
 	raddr string
@@ -412,14 +438,14 @@ type channelOpenDirectMsg struct {
 	lport uint32
 }
 
-func (c *Client) dial(laddr string, lport int, raddr string, rport int) (Channel, error) {
+func (c *Client) dial(ctx context.Context, laddr string, lport int, raddr string, rport int) (Channel, error) {
 	msg := channelOpenDirectMsg{
 		raddr: raddr,
 		rport: uint32(rport),
 		laddr: laddr,
 		lport: uint32(lport),
 	}
-	ch, in, err := c.OpenChannel("direct-tcpip", Marshal(&msg))
+	ch, in, err := c.OpenChannelWithContext(ctx, "direct-tcpip", Marshal(&msg))
 	if err != nil {
 		return nil, err
 	}

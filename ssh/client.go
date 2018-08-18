@@ -6,6 +6,7 @@ package ssh
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -24,6 +25,8 @@ type Client struct {
 	forwards        forwardList // forwarded tcpip connections from the remote side
 	mu              sync.Mutex
 	channelHandlers map[string]chan NewChannel
+
+	ctx context.Context
 }
 
 // HandleChannelOpen returns a channel on which NewChannel requests
@@ -49,8 +52,8 @@ func (c *Client) HandleChannelOpen(channelType string) <-chan NewChannel {
 	return ch
 }
 
-// NewClient creates a Client on top of the given connection.
-func NewClient(c Conn, chans <-chan NewChannel, reqs <-chan *Request) *Client {
+// NewClientContext creates a Client on top of the given connection.
+func NewClientContext(ctx context.Context, c Conn, chans <-chan NewChannel, reqs <-chan *Request) *Client {
 	conn := &Client{
 		Conn:            c,
 		channelHandlers: make(map[string]chan NewChannel, 1),
@@ -65,10 +68,15 @@ func NewClient(c Conn, chans <-chan NewChannel, reqs <-chan *Request) *Client {
 	return conn
 }
 
-// NewClientConn establishes an authenticated SSH connection using c
+// NewClient creates a Client by calling NewClientContext with the default background Context
+func NewClient(c Conn, chans <-chan NewChannel, reqs <-chan *Request) *Client {
+	return NewClientContext(context.Background(), c, chans, reqs)
+}
+
+// NewClientConnContext establishes an authenticated SSH connection using c
 // as the underlying transport.  The Request and NewChannel channels
 // must be serviced or the connection will hang.
-func NewClientConn(c net.Conn, addr string, config *ClientConfig) (Conn, <-chan NewChannel, <-chan *Request, error) {
+func NewClientConnContext(ctx context.Context, c net.Conn, addr string, config *ClientConfig) (Conn, <-chan NewChannel, <-chan *Request, error) {
 	fullConf := *config
 	fullConf.SetDefaults()
 	if fullConf.HostKeyCallback == nil {
@@ -80,17 +88,22 @@ func NewClientConn(c net.Conn, addr string, config *ClientConfig) (Conn, <-chan 
 		sshConn: sshConn{conn: c},
 	}
 
-	if err := conn.clientHandshake(addr, &fullConf); err != nil {
+	if err := conn.clientHandshake(ctx, addr, &fullConf); err != nil {
 		c.Close()
 		return nil, nil, nil, fmt.Errorf("ssh: handshake failed: %v", err)
 	}
-	conn.mux = newMux(conn.transport)
+	conn.mux = newMux(ctx, conn.transport)
 	return conn, conn.mux.incomingChannels, conn.mux.incomingRequests, nil
+}
+
+// NewClientConn simply calls NewClientConnContext with the default background context.
+func NewClientConn(c net.Conn, addr string, config *ClientConfig) (Conn, <-chan NewChannel, <-chan *Request, error) {
+	return NewClientConnContext(context.Background(), c, addr, config)
 }
 
 // clientHandshake performs the client side key exchange. See RFC 4253 Section
 // 7.
-func (c *connection) clientHandshake(dialAddress string, config *ClientConfig) error {
+func (c *connection) clientHandshake(ctx context.Context, dialAddress string, config *ClientConfig) error {
 	if config.ClientVersion != "" {
 		c.clientVersion = []byte(config.ClientVersion)
 	} else {
@@ -103,14 +116,15 @@ func (c *connection) clientHandshake(dialAddress string, config *ClientConfig) e
 	}
 
 	c.transport = newClientTransport(
+		ctx,
 		newTransport(c.sshConn.conn, config.Rand, true /* is client */),
 		c.clientVersion, c.serverVersion, config, dialAddress, c.sshConn.RemoteAddr())
-	if err := c.transport.waitSession(); err != nil {
+	if err := c.transport.waitSession(ctx); err != nil {
 		return err
 	}
 
 	c.sessionID = c.transport.getSessionID()
-	return c.clientAuthenticate(config)
+	return c.clientAuthenticate(ctx, config)
 }
 
 // verifyHostKeySignature verifies the host key obtained in the key
@@ -124,14 +138,19 @@ func verifyHostKeySignature(hostKey PublicKey, result *kexResult) error {
 	return hostKey.Verify(result.H, sig)
 }
 
-// NewSession opens a new Session for this client. (A session is a remote
+// NewSessionWithContext opens a new Session for this client. (A session is a remote
 // execution of a program.)
-func (c *Client) NewSession() (*Session, error) {
-	ch, in, err := c.OpenChannel("session", nil)
+func (c *Client) NewSessionWithContext(ctx context.Context) (*Session, error) {
+	ch, in, err := c.OpenChannelWithContext(ctx, "session", nil)
 	if err != nil {
 		return nil, err
 	}
 	return newSession(ch, in)
+}
+
+// NewSession calls NewSessionWithContext with the context boudn to client
+func (c *Client) NewSession() (*Session, error) {
+	return c.NewSessionWithContext(c.ctx)
 }
 
 func (c *Client) handleGlobalRequests(incoming <-chan *Request) {
@@ -164,21 +183,28 @@ func (c *Client) handleChannelOpens(in <-chan NewChannel) {
 	c.mu.Unlock()
 }
 
-// Dial starts a client connection to the given SSH server. It is a
+// DialContext starts a client connection to the given SSH server. It is a
 // convenience function that connects to the given network address,
 // initiates the SSH handshake, and then sets up a Client.  For access
 // to incoming channels and requests, use net.Dial with NewClientConn
 // instead.
+func DialContext(ctx context.Context, network, addr string, config *ClientConfig) (*Client, error) {
+	conn, err := (&net.Dialer{
+		Timeout: config.Timeout,
+	}).DialContext(ctx, network, addr)
+	if err != nil {
+		return nil, err
+	}
+	c, chans, reqs, err := NewClientConnContext(ctx, conn, addr, config)
+	if err != nil {
+		return nil, err
+	}
+	return NewClientContext(ctx, c, chans, reqs), nil
+}
+
+// Dial calls DialContext() with context.Background().
 func Dial(network, addr string, config *ClientConfig) (*Client, error) {
-	conn, err := net.DialTimeout(network, addr, config.Timeout)
-	if err != nil {
-		return nil, err
-	}
-	c, chans, reqs, err := NewClientConn(conn, addr, config)
-	if err != nil {
-		return nil, err
-	}
-	return NewClient(c, chans, reqs), nil
+	return DialContext(context.Background(), network, addr, config)
 }
 
 // HostKeyCallback is the function type used for verifying server

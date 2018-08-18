@@ -6,6 +6,7 @@ package ssh
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"strings"
@@ -84,9 +85,10 @@ func (b *closerBuffer) Close() error {
 
 func TestTransportMaxPacketWrite(t *testing.T) {
 	buf := &closerBuffer{}
+	ctx := context.Background()
 	tr := newTransport(buf, rand.Reader, true)
 	huge := make([]byte, maxPacket+1)
-	err := tr.writePacket(huge)
+	err := tr.writePacket(ctx, huge)
 	if err == nil {
 		t.Errorf("transport accepted write for a huge packet.")
 	}
@@ -103,8 +105,9 @@ func TestTransportMaxPacketReader(t *testing.T) {
 	buf.Write(header[:])
 	buf.Write(huge)
 
+	ctx := context.Background()
 	tr := newTransport(buf, rand.Reader, true)
-	_, err := tr.readPacket()
+	_, err := tr.readPacket(ctx)
 	if err == nil {
 		t.Errorf("transport succeeded reading huge packet.")
 	} else if !strings.Contains(err.Error(), "large") {

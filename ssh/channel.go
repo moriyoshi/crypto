@@ -5,6 +5,7 @@
 package ssh
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -42,6 +43,9 @@ type NewChannel interface {
 	// ExtraData returns the arbitrary payload for this channel, as supplied
 	// by the client. This data is specific to the channel type.
 	ExtraData() []byte
+
+	// Context() returns the channel-bound context, which may be nil.
+	Context() context.Context
 }
 
 // A Channel is an ordered, reliable, flow-controlled, duplex stream
@@ -50,8 +54,14 @@ type Channel interface {
 	// Read reads up to len(data) bytes from the channel.
 	Read(data []byte) (int, error)
 
+	// ReadWithContext is a cancelable version of Read().
+	ReadWithContext(ctx context.Context, data []byte) (int, error)
+
 	// Write writes len(data) bytes to the channel.
 	Write(data []byte) (int, error)
+
+	// WriteWithContext is a cancelable version of Write().
+	WriteWithContext(ctx context.Context, data []byte) (int, error)
 
 	// Close signals end of channel use. No data may be sent after this
 	// call.
@@ -76,6 +86,9 @@ type Channel interface {
 	// safely be read and written from a different goroutine than
 	// Read and Write respectively.
 	Stderr() io.ReadWriter
+
+	// Context() returns the channel-bound context, which may be nil.
+	Context() context.Context
 }
 
 // Request is a request sent outside of the normal stream of
@@ -90,19 +103,24 @@ type Request struct {
 	mux *mux
 }
 
-// Reply sends a response to a request. It must be called for all requests
+// ReplyWithContext sends a response to a request. It must be called for all requests
 // where WantReply is true and is a no-op otherwise. The payload argument is
 // ignored for replies to channel-specific requests.
-func (r *Request) Reply(ok bool, payload []byte) error {
+func (r *Request) ReplyWithContext(ctx context.Context, ok bool, payload []byte) error {
 	if !r.WantReply {
 		return nil
 	}
 
 	if r.ch == nil {
-		return r.mux.ackRequest(ok, payload)
+		return r.mux.ackRequest(ctx, ok, payload)
 	}
 
 	return r.ch.ackRequest(ok)
+}
+
+// Reply simply calls ReplyWithContext with the first argument being nil.
+func (r *Request) Reply(ok bool, payload []byte) error {
+	return r.ReplyWithContext(nil, ok, payload)
 }
 
 // RejectionReason is an enumeration used when rejecting channel creation
@@ -201,35 +219,38 @@ type channel struct {
 	// packetPool has a buffer for each extended channel ID to
 	// save allocations during writes.
 	packetPool map[uint32][]byte
+
+	// channel-bound context
+	ctx context.Context
 }
 
 // writePacket sends a packet. If the packet is a channel close, it updates
 // sentClose. This method takes the lock c.writeMu.
-func (ch *channel) writePacket(packet []byte) error {
+func (ch *channel) writePacket(ctx context.Context, packet []byte) error {
 	ch.writeMu.Lock()
 	if ch.sentClose {
 		ch.writeMu.Unlock()
 		return io.EOF
 	}
 	ch.sentClose = (packet[0] == msgChannelClose)
-	err := ch.mux.conn.writePacket(packet)
+	err := ch.mux.conn.writePacket(ctx, packet)
 	ch.writeMu.Unlock()
 	return err
 }
 
-func (ch *channel) sendMessage(msg interface{}) error {
+func (ch *channel) sendMessage(ctx context.Context, msg interface{}) error {
 	if debugMux {
 		log.Printf("send(%d): %#v", ch.mux.chanList.offset, msg)
 	}
 
 	p := Marshal(msg)
 	binary.BigEndian.PutUint32(p[1:], ch.remoteId)
-	return ch.writePacket(p)
+	return ch.writePacket(ctx, p)
 }
 
 // WriteExtended writes data to a specific extended stream. These streams are
 // used, for example, for stderr.
-func (ch *channel) WriteExtended(data []byte, extendedCode uint32) (n int, err error) {
+func (ch *channel) WriteExtended(ctx context.Context, data []byte, extendedCode uint32) (n int, err error) {
 	if ch.sentEOF {
 		return 0, io.EOF
 	}
@@ -268,7 +289,7 @@ func (ch *channel) WriteExtended(data []byte, extendedCode uint32) (n int, err e
 		}
 		binary.BigEndian.PutUint32(packet[headerLength-4:], uint32(len(todo)))
 		copy(packet[headerLength:], todo)
-		if err = ch.writePacket(packet); err != nil {
+		if err = ch.writePacket(ctx, packet); err != nil {
 			return n, err
 		}
 
@@ -338,17 +359,20 @@ func (c *channel) adjustWindow(n uint32) error {
 	// the initial window setting, we don't worry about overflow.
 	c.myWindow += uint32(n)
 	c.windowMu.Unlock()
-	return c.sendMessage(windowAdjustMsg{
-		AdditionalBytes: uint32(n),
-	})
+	return c.sendMessage(
+		c.ctx,
+		windowAdjustMsg{
+			AdditionalBytes: uint32(n),
+		},
+	)
 }
 
-func (c *channel) ReadExtended(data []byte, extended uint32) (n int, err error) {
+func (c *channel) ReadExtended(ctx context.Context, data []byte, extended uint32) (n int, err error) {
 	switch extended {
 	case 1:
-		n, err = c.extPending.Read(data)
+		n, err = c.extPending.ReadWithContext(ctx, data)
 	case 0:
-		n, err = c.pending.Read(data)
+		n, err = c.pending.ReadWithContext(ctx, data)
 	default:
 		return 0, fmt.Errorf("ssh: extended code %d unimplemented", extended)
 	}
@@ -400,7 +424,7 @@ func (ch *channel) handlePacket(packet []byte) error {
 	case msgChannelData, msgChannelExtendedData:
 		return ch.handleData(packet)
 	case msgChannelClose:
-		ch.sendMessage(channelCloseMsg{PeersID: ch.remoteId})
+		ch.sendMessage(ch.ctx, channelCloseMsg{PeersID: ch.remoteId})
 		ch.mux.chanList.remove(ch.localId)
 		ch.close()
 		return nil
@@ -467,6 +491,7 @@ func (m *mux) newChannel(chanType string, direction channelDirection, extraData 
 		extraData:        extraData,
 		mux:              m,
 		packetPool:       make(map[uint32][]byte),
+		ctx:              m.ctx,
 	}
 	ch.localId = m.chanList.add(ch)
 	return ch
@@ -481,11 +506,23 @@ type extChannel struct {
 }
 
 func (e *extChannel) Write(data []byte) (n int, err error) {
-	return e.ch.WriteExtended(data, e.code)
+	return e.WriteWithContext(e.ch.ctx, data)
+}
+
+func (e *extChannel) WriteWithContext(ctx context.Context, data []byte) (n int, err error) {
+	return e.ch.WriteExtended(ctx, data, e.code)
 }
 
 func (e *extChannel) Read(data []byte) (n int, err error) {
-	return e.ch.ReadExtended(data, e.code)
+	return e.ReadWithContext(e.ch.ctx, data)
+}
+
+func (e *extChannel) ReadWithContext(ctx context.Context, data []byte) (n int, err error) {
+	return e.ch.ReadExtended(ctx, data, e.code)
+}
+
+func (ch *channel) Context() context.Context {
+	return ch.ctx
 }
 
 func (ch *channel) Accept() (Channel, <-chan *Request, error) {
@@ -500,7 +537,7 @@ func (ch *channel) Accept() (Channel, <-chan *Request, error) {
 		MaxPacketSize: ch.maxIncomingPayload,
 	}
 	ch.decided = true
-	if err := ch.sendMessage(confirm); err != nil {
+	if err := ch.sendMessage(ch.ctx, confirm); err != nil {
 		return nil, nil, err
 	}
 
@@ -518,21 +555,29 @@ func (ch *channel) Reject(reason RejectionReason, message string) error {
 		Language: "en",
 	}
 	ch.decided = true
-	return ch.sendMessage(reject)
+	return ch.sendMessage(ch.ctx, reject)
 }
 
 func (ch *channel) Read(data []byte) (int, error) {
+	return ch.ReadWithContext(ch.ctx, data)
+}
+
+func (ch *channel) ReadWithContext(ctx context.Context, data []byte) (int, error) {
 	if !ch.decided {
 		return 0, errUndecided
 	}
-	return ch.ReadExtended(data, 0)
+	return ch.ReadExtended(ctx, data, 0)
 }
 
 func (ch *channel) Write(data []byte) (int, error) {
+	return ch.WriteWithContext(ch.ctx, data)
+}
+
+func (ch *channel) WriteWithContext(ctx context.Context, data []byte) (int, error) {
 	if !ch.decided {
 		return 0, errUndecided
 	}
-	return ch.WriteExtended(data, 0)
+	return ch.WriteExtended(ctx, data, 0)
 }
 
 func (ch *channel) CloseWrite() error {
@@ -540,7 +585,7 @@ func (ch *channel) CloseWrite() error {
 		return errUndecided
 	}
 	ch.sentEOF = true
-	return ch.sendMessage(channelEOFMsg{
+	return ch.sendMessage(ch.ctx, channelEOFMsg{
 		PeersID: ch.remoteId})
 }
 
@@ -549,7 +594,7 @@ func (ch *channel) Close() error {
 		return errUndecided
 	}
 
-	return ch.sendMessage(channelCloseMsg{
+	return ch.sendMessage(ch.ctx, channelCloseMsg{
 		PeersID: ch.remoteId})
 }
 
@@ -567,6 +612,10 @@ func (ch *channel) Stderr() io.ReadWriter {
 }
 
 func (ch *channel) SendRequest(name string, wantReply bool, payload []byte) (bool, error) {
+	return ch.SendRequestWithContext(ch.ctx, name, wantReply, payload)
+}
+
+func (ch *channel) SendRequestWithContext(ctx context.Context, name string, wantReply bool, payload []byte) (bool, error) {
 	if !ch.decided {
 		return false, errUndecided
 	}
@@ -583,7 +632,7 @@ func (ch *channel) SendRequest(name string, wantReply bool, payload []byte) (boo
 		RequestSpecificData: payload,
 	}
 
-	if err := ch.sendMessage(msg); err != nil {
+	if err := ch.sendMessage(ctx, msg); err != nil {
 		return false, err
 	}
 
@@ -621,7 +670,7 @@ func (ch *channel) ackRequest(ok bool) error {
 			PeersID: ch.remoteId,
 		}
 	}
-	return ch.sendMessage(msg)
+	return ch.sendMessage(ch.ctx, msg)
 }
 
 func (ch *channel) ChannelType() string {

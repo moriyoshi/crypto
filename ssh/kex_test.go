@@ -7,6 +7,7 @@ package ssh
 // Key exchange tests.
 
 import (
+	"context"
 	"crypto/rand"
 	"reflect"
 	"testing"
@@ -18,6 +19,8 @@ func TestKexes(t *testing.T) {
 		err    error
 	}
 
+	ctx := context.Background()
+
 	for name, kex := range kexAlgoMap {
 		a, b := memPipe()
 
@@ -25,12 +28,12 @@ func TestKexes(t *testing.T) {
 		c := make(chan kexResultErr, 1)
 		var magics handshakeMagics
 		go func() {
-			r, e := kex.Client(a, rand.Reader, &magics)
+			r, e := kex.Client(ctx, a, rand.Reader, &magics)
 			a.Close()
 			c <- kexResultErr{r, e}
 		}()
 		go func() {
-			r, e := kex.Server(b, rand.Reader, &magics, testSigners["ecdsa"])
+			r, e := kex.Server(ctx, b, rand.Reader, &magics, testSigners["ecdsa"])
 			b.Close()
 			s <- kexResultErr{r, e}
 		}()

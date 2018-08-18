@@ -5,6 +5,7 @@
 package ssh
 
 import (
+	"context"
 	"fmt"
 	"net"
 )
@@ -50,17 +51,26 @@ type ConnMetadata interface {
 type Conn interface {
 	ConnMetadata
 
-	// SendRequest sends a global request, and returns the
-	// reply. If wantReply is true, it returns the response status
-	// and payload. See also RFC4254, section 4.
+	// SendRequest sends a global request with the context bound to the
+	// connection.  Except for that, It behaves exactly in the same way as
+	// SendRequestWithContext.
 	SendRequest(name string, wantReply bool, payload []byte) (bool, []byte, error)
 
-	// OpenChannel tries to open an channel. If the request is
+	// SendRequestWithContext sends a global request, and returns the
+	// reply. If wantReply is true, it returns the response status
+	// and payload. See also RFC4254, section 4.
+	SendRequestWithContext(ctx context.Context, name string, wantReply bool, payload []byte) (bool, []byte, error)
+
+	// OpenChannel tries to open an channel with the context bound to the connection.
+	// Except for that, it behaves exactly in the same way as OpenChannelWithContext.
+	OpenChannel(name string, data []byte) (Channel, <-chan *Request, error)
+
+	// OpenChannelWithContext tries to open an channel. If the request is
 	// rejected, it returns *OpenChannelError. On success it returns
 	// the SSH Channel and a Go channel for incoming, out-of-band
 	// requests. The Go channel must be serviced, or the
 	// connection will hang.
-	OpenChannel(name string, data []byte) (Channel, <-chan *Request, error)
+	OpenChannelWithContext(ctx context.Context, name string, data []byte) (Channel, <-chan *Request, error)
 
 	// Close closes the underlying network connection
 	Close() error

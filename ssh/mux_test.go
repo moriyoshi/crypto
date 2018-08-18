@@ -5,6 +5,7 @@
 package ssh
 
 import (
+	"context"
 	"io"
 	"io/ioutil"
 	"sync"
@@ -12,10 +13,11 @@ import (
 )
 
 func muxPair() (*mux, *mux) {
+	ctx := context.Background()
 	a, b := memPipe()
 
-	s := newMux(a)
-	c := newMux(b)
+	s := newMux(ctx, a)
+	c := newMux(ctx, b)
 
 	return s, c
 }
@@ -41,7 +43,7 @@ func channelPair(t *testing.T) (*channel, *channel, *mux) {
 		res <- ch.(*channel)
 	}()
 
-	ch, err := c.openChannel("chan", nil)
+	ch, err := c.openChannel(nil, "chan", nil)
 	if err != nil {
 		t.Fatalf("OpenChannel: %v", err)
 	}
@@ -137,6 +139,8 @@ func TestMuxChannelOverflow(t *testing.T) {
 	defer writer.Close()
 	defer mux.Close()
 
+	ctx := context.Background()
+
 	wDone := make(chan int, 1)
 	go func() {
 		if _, err := writer.Write(make([]byte, channelWindowSize)); err != nil {
@@ -154,7 +158,7 @@ func TestMuxChannelOverflow(t *testing.T) {
 	marshalUint32(packet[5:], uint32(1))
 	packet[9] = 42
 
-	if err := writer.mux.conn.writePacket(packet); err != nil {
+	if err := writer.mux.conn.writePacket(ctx, packet); err != nil {
 		t.Errorf("could not send packet")
 	}
 	if _, err := reader.SendRequest("hello", true, nil); err == nil {
@@ -223,7 +227,7 @@ func TestMuxReject(t *testing.T) {
 		ch.Reject(RejectionReason(42), "message")
 	}()
 
-	ch, err := client.openChannel("ch", []byte("extra"))
+	ch, err := client.openChannel(nil, "ch", []byte("extra"))
 	if ch != nil {
 		t.Fatal("openChannel not rejected")
 	}
@@ -426,13 +430,15 @@ func TestMuxInvalidRecord(t *testing.T) {
 	defer a.Close()
 	defer b.Close()
 
+	ctx := context.Background()
+
 	packet := make([]byte, 1+4+4+1)
 	packet[0] = msgChannelData
 	marshalUint32(packet[1:], 29348723 /* invalid channel id */)
 	marshalUint32(packet[5:], 1)
 	packet[9] = 42
 
-	a.conn.writePacket(packet)
+	a.conn.writePacket(ctx, packet)
 	go a.SendRequest("hello", false, nil)
 	// 'a' wrote an invalid packet, so 'b' has exited.
 	req, ok := <-b.incomingRequests
@@ -450,7 +456,7 @@ func TestZeroWindowAdjust(t *testing.T) {
 	go func() {
 		io.WriteString(a, "hello")
 		// bogus adjust.
-		a.sendMessage(windowAdjustMsg{})
+		a.sendMessage(nil, windowAdjustMsg{})
 		io.WriteString(a, "world")
 		a.Close()
 	}()
@@ -468,6 +474,8 @@ func TestMuxMaxPacketSize(t *testing.T) {
 	defer b.Close()
 	defer mux.Close()
 
+	ctx := context.Background()
+
 	large := make([]byte, a.maxRemotePayload+1)
 	packet := make([]byte, 1+4+4+1+len(large))
 	packet[0] = msgChannelData
@@ -475,7 +483,7 @@ func TestMuxMaxPacketSize(t *testing.T) {
 	marshalUint32(packet[5:], uint32(len(large)))
 	packet[9] = 42
 
-	if err := a.mux.conn.writePacket(packet); err != nil {
+	if err := a.mux.conn.writePacket(ctx, packet); err != nil {
 		t.Errorf("could not send packet")
 	}
 

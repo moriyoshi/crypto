@@ -1,6 +1,7 @@
 package ssh
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net"
@@ -30,14 +31,14 @@ type streamLocalChannelForwardMsg struct {
 	socketPath string
 }
 
-// ListenUnix is similar to ListenTCP but uses a Unix domain socket.
-func (c *Client) ListenUnix(socketPath string) (net.Listener, error) {
+// ListenUnixContext is similar to ListenTCPContext but uses a Unix domain socket.
+func (c *Client) ListenUnixContext(ctx context.Context, socketPath string) (net.Listener, error) {
 	c.handleForwardsOnce.Do(c.handleForwards)
 	m := streamLocalChannelForwardMsg{
 		socketPath,
 	}
 	// send message
-	ok, _, err := c.SendRequest("streamlocal-forward@openssh.com", true, Marshal(&m))
+	ok, _, err := c.SendRequestWithContext(ctx, "streamlocal-forward@openssh.com", true, Marshal(&m))
 	if err != nil {
 		return nil, err
 	}
@@ -49,11 +50,16 @@ func (c *Client) ListenUnix(socketPath string) (net.Listener, error) {
 	return &unixListener{socketPath, c, ch}, nil
 }
 
-func (c *Client) dialStreamLocal(socketPath string) (Channel, error) {
+// ListenUnix simply calls ListenUnixContext with the default background context.
+func (c *Client) ListenUnix(socketPath string) (net.Listener, error) {
+	return c.ListenUnixContext(context.Background(), socketPath)
+}
+
+func (c *Client) dialStreamLocal(ctx context.Context, socketPath string) (Channel, error) {
 	msg := streamLocalChannelOpenDirectMsg{
 		socketPath: socketPath,
 	}
-	ch, in, err := c.OpenChannel("direct-streamlocal@openssh.com", Marshal(&msg))
+	ch, in, err := c.OpenChannelWithContext(ctx, "direct-streamlocal@openssh.com", Marshal(&msg))
 	if err != nil {
 		return nil, err
 	}
@@ -93,18 +99,23 @@ func (l *unixListener) Accept() (net.Conn, error) {
 	}, nil
 }
 
-// Close closes the listener.
-func (l *unixListener) Close() error {
+// CloseWithContext closes the listener.
+func (l *unixListener) CloseWithContext(ctx context.Context) error {
 	// this also closes the listener.
 	l.conn.forwards.remove(&net.UnixAddr{Name: l.socketPath, Net: "unix"})
 	m := streamLocalChannelForwardMsg{
 		l.socketPath,
 	}
-	ok, _, err := l.conn.SendRequest("cancel-streamlocal-forward@openssh.com", true, Marshal(&m))
+	ok, _, err := l.conn.SendRequestWithContext(ctx, "cancel-streamlocal-forward@openssh.com", true, Marshal(&m))
 	if err == nil && !ok {
 		err = errors.New("ssh: cancel-streamlocal-forward@openssh.com failed")
 	}
 	return err
+}
+
+// Close simply calls CloseWithContext with the default background context.
+func (l *unixListener) Close() error {
+	return l.CloseWithContext(context.Background())
 }
 
 // Addr returns the listener's network address.
